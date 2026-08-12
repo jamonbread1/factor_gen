@@ -7,10 +7,10 @@ import os
 LOG = logging.getLogger("factor_gen.gm3")
 
 try:
-    from gm.api import ADJUST_NONE, history, stk_get_index_constituents, set_token
+    from gm.api import ADJUST_NONE, history_n, stk_get_index_constituents, set_token
 except Exception:
     ADJUST_NONE = None
-    history = None
+    history_n = None
     stk_get_index_constituents = None
     set_token = None
 
@@ -39,10 +39,7 @@ class GM3DataAdapter:
         except Exception as exc:
             msg = str(exc)
             if "1000" in msg or "token" in msg.lower():
-                raise RuntimeError(
-                    "GM3返回1000：错误或无效的token。请在掘金3【系统设置→密钥管理】检查token；"
-                    "若直接用 python main.py 运行，请先设置环境变量 GM_TOKEN 或 GM3_TOKEN。"
-                ) from exc
+                raise RuntimeError("GM3返回1000：错误或无效的token。请在掘金3【系统设置→密钥管理】检查token。") from exc
             raise RuntimeError(f"GM3获取指数成分股失败: {exc}") from exc
         if result is None:
             raise RuntimeError(f"GM3未返回指数成分股: {self.index}")
@@ -60,35 +57,42 @@ class GM3DataAdapter:
         return symbols[: self.max_symbols]
 
     def load(self):
-        if history is None:
-            raise RuntimeError("必须在掘金3环境运行：未找到 gm.api")
+        if history_n is None:
+            raise RuntimeError("必须在掘金3环境运行：未找到 gm.api.history_n")
         self._configure_token()
         import pandas as pd
         symbols = self._resolve_symbols()
         LOG.info("[GM3] universe=%s symbols=%d bars=%d", self.index, len(symbols), self.count)
         frames = []
         for i, symbol in enumerate(symbols, 1):
-            LOG.info("[GM3] history %d/%d: %s", i, len(symbols), symbol)
+            LOG.info("[GM3] history_n %d/%d: %s", i, len(symbols), symbol)
             kwargs = dict(symbol=symbol, frequency=self.frequency,
+                          count=self.count,
                           fields="symbol,eob,open,high,low,close,volume,amount",
-                          count=self.count, df=True)
+                          df=True)
             if ADJUST_NONE is not None:
                 kwargs["adjust"] = ADJUST_NONE
             try:
-                df = history(**kwargs)
+                df = history_n(**kwargs)
             except TypeError:
+                # Some GM3 SDK builds differ on optional arguments. Retry with only
+                # the stable history_n parameters before failing.
                 kwargs.pop("adjust", None)
-                df = history(**kwargs)
+                try:
+                    df = history_n(**kwargs)
+                except TypeError:
+                    kwargs.pop("df", None)
+                    df = history_n(**kwargs)
             except Exception as exc:
                 msg = str(exc)
                 if "1000" in msg or "token" in msg.lower():
-                    raise RuntimeError(
-                        "GM3历史行情返回1000：token无效或未设置。请检查掘金3【系统设置→密钥管理】。"
-                    ) from exc
+                    raise RuntimeError("GM3历史行情返回1000：token无效或未设置。请检查掘金3【系统设置→密钥管理】。") from exc
                 raise
             if df is None or len(df) == 0:
                 LOG.warning("[GM3] no bars returned: %s", symbol)
                 continue
+            if not hasattr(df, "columns"):
+                raise RuntimeError("GM3 history_n 未返回DataFrame；请确认 df=True 可用。")
             frames.append(df)
         if not frames:
             raise RuntimeError("GM3未返回K线：请检查标的、token、权限以及回测时间范围")
