@@ -1,0 +1,14 @@
+# factor_gen V2 defaults for a 4 GB RTX 3050
+seed: 42
+seq_len: 64
+epochs: 5
+batch_size: 32
+learning_rate: 0.0002
+device: auto
+amp: true
+candidate_count: 1000000
+top_k: 100
+ic_threshold: 0.03
+ic_window: 252
+min_positive_window_ratio: 0.60
+output_dir: generated
