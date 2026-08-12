@@ -13,20 +13,27 @@ class V42Transformer:
         self.device = None
 
     def _windows(self, X, y=None):
-        n = max(0, len(X) - self.seq_len)
+        # A window ending at row i predicts target[i]. Therefore the first
+        # valid target is seq_len-1, and the number of windows is
+        # len(X)-seq_len+1. Keep X/y lengths identical by construction.
+        n = max(0, len(X) - self.seq_len + 1)
         if n == 0:
             return np.empty((0, self.seq_len, X.shape[1]), np.float32), np.empty((0,), np.float32) if y is not None else None
-        wx = np.lib.stride_tricks.sliding_window_view(X, (self.seq_len, X.shape[1]))[:, 0, :, :].copy().astype(np.float32, copy=False)
-        wy = y[self.seq_len:].astype(np.float32, copy=False) if y is not None else None
+        wx = np.lib.stride_tricks.sliding_window_view(
+            X, (self.seq_len, X.shape[1])
+        )[:, 0, :, :].copy().astype(np.float32, copy=False)
+        wx = wx[:n]
+        wy = y[self.seq_len - 1:self.seq_len - 1 + n].astype(np.float32, copy=False) if y is not None else None
+        if y is not None and len(wx) != len(wy):
+            raise RuntimeError(f"Transformer window/target mismatch: X={len(wx)} y={len(wy)}")
         return wx, wy
 
     def _windows_by_symbol(self, frame, features, target):
         xs, ys = [], []
-        # Training windows must never cross stock boundaries.
         for _, part in frame.groupby("symbol", sort=False):
             X = part[features].to_numpy(np.float32)
             y = part[target].to_numpy(np.float32)
-            if len(X) <= self.seq_len:
+            if len(X) < self.seq_len:
                 continue
             wx, wy = self._windows(X, y)
             if len(wx):
@@ -34,7 +41,11 @@ class V42Transformer:
                 ys.append(wy)
         if not xs:
             return np.empty((0, self.seq_len, len(features)), np.float32), np.empty((0,), np.float32)
-        return np.concatenate(xs, axis=0), np.concatenate(ys, axis=0)
+        X_all = np.concatenate(xs, axis=0)
+        y_all = np.concatenate(ys, axis=0)
+        if len(X_all) != len(y_all):
+            raise RuntimeError(f"Transformer dataset mismatch: X={len(X_all)} y={len(y_all)}")
+        return X_all, y_all
 
     def _get_device(self, torch):
         if torch.cuda.is_available():
@@ -47,13 +58,14 @@ class V42Transformer:
         return torch.device("cpu")
 
     def _iter_predict_batches(self, X):
-        total = max(0, len(X) - self.seq_len)
+        total = max(0, len(X) - self.seq_len + 1)
         for first in range(0, total, self.infer_batch_size):
             last = min(first + self.infer_batch_size, total)
             wx = np.empty((last - first, self.seq_len, X.shape[1]), dtype=np.float32)
             for j, i in enumerate(range(first, last)):
                 wx[j] = X[i:i + self.seq_len]
-            yield first + self.seq_len, wx
+            # First prediction corresponds to row seq_len-1.
+            yield first + self.seq_len - 1, wx
 
     def fit(self, frame, features, target):
         try:
@@ -67,8 +79,6 @@ class V42Transformer:
         X_all = frame[features].to_numpy(np.float32)
         self.mu = np.nanmean(X_all, axis=0)
         self.sd = np.nanstd(X_all, axis=0) + 1e-6
-
-        # Normalize first, then build independent per-symbol windows.
         normalized = frame.copy()
         normalized.loc[:, features] = np.nan_to_num((X_all - self.mu) / self.sd)
         wx, wy = self._windows_by_symbol(normalized, features, target)
@@ -89,9 +99,10 @@ class V42Transformer:
         tx_cpu = torch.from_numpy(wx)
         ty_cpu = torch.from_numpy(wy)
         n = len(tx_cpu)
+        if n != len(ty_cpu):
+            raise RuntimeError(f"Transformer training data mismatch: X={n} y={len(ty_cpu)}")
         print(f"[Transformer] training samples={n} batch={self.batch_size} device={self.device} chunked=True")
 
-        # Keep the dataset on CPU. Only one mini-batch enters the 4GB GPU.
         for ep in range(self.epochs):
             self.net.train()
             total_loss = 0.0
@@ -119,7 +130,7 @@ class V42Transformer:
         import torch
         X = frame[features].to_numpy(np.float32)
         X = np.nan_to_num((X - self.mu) / self.sd)
-        total = max(0, len(X) - self.seq_len)
+        total = max(0, len(X) - self.seq_len + 1)
         if total == 0:
             return
         device = next(self.net.parameters()).device
