@@ -1,11 +1,8 @@
-# Install a PyTorch build compatible with your NVIDIA driver first if needed.
-# The 592.82 driver reports CUDA 13.1; PyTorch wheels bundle their CUDA runtime.
+# GM3 data access is supplied by the 掘金 terminal environment.
+# PyTorch wheels bundle the CUDA runtime; nvidia-smi CUDA 13.1 is the driver capability.
 torch>=2.4
-transformers>=4.45
 pandas>=2.0
 numpy>=1.26
 scipy>=1.11
-scikit-learn>=1.4
 tqdm>=4.66
-pyyaml>=6.0
 loguru>=0.7
