@@ -20,6 +20,22 @@ class V42Transformer:
         wy = y[self.seq_len:].astype(np.float32, copy=False) if y is not None else None
         return wx, wy
 
+    def _windows_by_symbol(self, frame, features, target):
+        xs, ys = [], []
+        # Training windows must never cross stock boundaries.
+        for _, part in frame.groupby("symbol", sort=False):
+            X = part[features].to_numpy(np.float32)
+            y = part[target].to_numpy(np.float32)
+            if len(X) <= self.seq_len:
+                continue
+            wx, wy = self._windows(X, y)
+            if len(wx):
+                xs.append(wx)
+                ys.append(wy)
+        if not xs:
+            return np.empty((0, self.seq_len, len(features)), np.float32), np.empty((0,), np.float32)
+        return np.concatenate(xs, axis=0), np.concatenate(ys, axis=0)
+
     def _get_device(self, torch):
         if torch.cuda.is_available():
             device = torch.device("cuda")
@@ -31,7 +47,6 @@ class V42Transformer:
         return torch.device("cpu")
 
     def _iter_predict_batches(self, X):
-        """Yield (output_start, batch_windows) with bounded host/GPU memory."""
         total = max(0, len(X) - self.seq_len)
         for first in range(0, total, self.infer_batch_size):
             last = min(first + self.infer_batch_size, total)
@@ -49,18 +64,21 @@ class V42Transformer:
             print("[Transformer] PyTorch not installed; AI score disabled")
             return self
 
-        X = frame[features].to_numpy(np.float32)
-        y = frame[target].to_numpy(np.float32)
-        self.mu = np.nanmean(X, axis=0)
-        self.sd = np.nanstd(X, axis=0) + 1e-6
-        X = np.nan_to_num((X - self.mu) / self.sd)
-        wx, wy = self._windows(X, y)
+        X_all = frame[features].to_numpy(np.float32)
+        self.mu = np.nanmean(X_all, axis=0)
+        self.sd = np.nanstd(X_all, axis=0) + 1e-6
+
+        # Normalize first, then build independent per-symbol windows.
+        normalized = frame.copy()
+        normalized.loc[:, features] = np.nan_to_num((X_all - self.mu) / self.sd)
+        wx, wy = self._windows_by_symbol(normalized, features, target)
         if len(wx) == 0:
             print("[Transformer] no training windows")
             return self
+        wy = np.nan_to_num(wy.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
         self.device = self._get_device(torch)
-        proj = nn.Linear(X.shape[1], self.d_model)
+        proj = nn.Linear(wx.shape[2], self.d_model)
         enc_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=self.heads, batch_first=True)
         enc = nn.TransformerEncoder(enc_layer, self.layers)
         head = nn.Linear(self.d_model, 1)
@@ -68,27 +86,32 @@ class V42Transformer:
 
         opt = torch.optim.AdamW(self.net.parameters(), lr=2e-3, weight_decay=1e-4)
         loss_fn = nn.HuberLoss()
-        tx = torch.from_numpy(wx).to(self.device)
-        ty = torch.from_numpy(wy).to(self.device)
+        tx_cpu = torch.from_numpy(wx)
+        ty_cpu = torch.from_numpy(wy)
+        n = len(tx_cpu)
+        print(f"[Transformer] training samples={n} batch={self.batch_size} device={self.device} chunked=True")
 
-        print(f"[Transformer] training samples={len(tx)} batch={self.batch_size} device={self.device}")
+        # Keep the dataset on CPU. Only one mini-batch enters the 4GB GPU.
         for ep in range(self.epochs):
             self.net.train()
             total_loss = 0.0
             batches = 0
-            order = torch.randperm(len(tx), device=self.device)
-            for start in range(0, len(order), self.batch_size):
-                idx = order[start:start+self.batch_size]
-                h = self.net[0](tx[idx])
+            order = torch.randperm(n, device="cpu")
+            for start in range(0, n, self.batch_size):
+                idx = order[start:start + self.batch_size]
+                xb = tx_cpu[idx].to(self.device, non_blocking=True)
+                yb = ty_cpu[idx].to(self.device, non_blocking=True)
+                h = self.net[0](xb)
                 h = self.net[1](h)
                 pred = self.net[2](h[:, -1, :]).squeeze(-1)
-                loss = loss_fn(pred, ty[idx])
+                loss = loss_fn(pred, yb)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 opt.step()
                 total_loss += loss.detach().item()
                 batches += 1
+                del xb, yb, h, pred, loss
             print(f"[Transformer] epoch {ep+1}/{self.epochs} loss={total_loss/max(1,batches):.6f} device={self.device}")
         return self
 
@@ -114,13 +137,13 @@ class V42Transformer:
                 else:
                     out[index_positions[start_pos:end_pos]] = pred
                 done += len(pred)
+                del tx, h
         print(f"[Transformer] inference {done}/{total} samples batch={self.infer_batch_size} device={device}")
 
     def predict(self, frame, features):
         out = np.full(len(frame), np.nan, np.float32)
         if self.net is None or len(frame) == 0:
             return out
-        # Do not allow a sequence to cross from one stock into another.
         if "symbol" in frame.columns:
             for _, positions in frame.groupby("symbol", sort=False).indices.items():
                 positions = np.asarray(positions, dtype=np.int64)
