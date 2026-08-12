@@ -16,7 +16,6 @@ class V42Transformer:
         n = max(0, len(X) - self.seq_len)
         if n == 0:
             return np.empty((0, self.seq_len, X.shape[1]), np.float32), np.empty((0,), np.float32) if y is not None else None
-        # Allocate only once; this is used for training where the training set is intentionally materialized.
         wx = np.lib.stride_tricks.sliding_window_view(X, (self.seq_len, X.shape[1]))[:, 0, :, :].copy().astype(np.float32, copy=False)
         wy = y[self.seq_len:].astype(np.float32, copy=False) if y is not None else None
         return wx, wy
@@ -32,23 +31,10 @@ class V42Transformer:
         return torch.device("cpu")
 
     def _iter_predict_batches(self, X):
-        """Yield (start_index, batch_windows) without materializing all inference windows."""
-        for end in range(self.seq_len + self.infer_batch_size, len(X) + 1, self.infer_batch_size):
-            start_window = end - self.infer_batch_size
-            if start_window < self.seq_len:
-                start_window = self.seq_len
-            first = start_window - self.seq_len
-            last = end - self.seq_len
-            if last <= first:
-                continue
-            wx = np.empty((last - first, self.seq_len, X.shape[1]), dtype=np.float32)
-            for j, i in enumerate(range(first, last)):
-                wx[j] = X[i:i + self.seq_len]
-            yield start_window, wx
-        # Tail batch.
-        first = max(0, len(X) - self.seq_len - ((len(X) - self.seq_len) % self.infer_batch_size))
-        last = len(X) - self.seq_len
-        if last > first:
+        """Yield (output_start, batch_windows) with bounded host/GPU memory."""
+        total = max(0, len(X) - self.seq_len)
+        for first in range(0, total, self.infer_batch_size):
+            last = min(first + self.infer_batch_size, total)
             wx = np.empty((last - first, self.seq_len, X.shape[1]), dtype=np.float32)
             for j, i in enumerate(range(first, last)):
                 wx[j] = X[i:i + self.seq_len]
@@ -88,7 +74,7 @@ class V42Transformer:
         print(f"[Transformer] training samples={len(tx)} batch={self.batch_size} device={self.device}")
         for ep in range(self.epochs):
             self.net.train()
-            total = 0.0
+            total_loss = 0.0
             batches = 0
             order = torch.randperm(len(tx), device=self.device)
             for start in range(0, len(order), self.batch_size):
@@ -101,20 +87,20 @@ class V42Transformer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
                 opt.step()
-                total += loss.detach().item()
+                total_loss += loss.detach().item()
                 batches += 1
-            print(f"[Transformer] epoch {ep+1}/{self.epochs} loss={total/max(1,batches):.6f} device={self.device}")
+            print(f"[Transformer] epoch {ep+1}/{self.epochs} loss={total_loss/max(1,batches):.6f} device={self.device}")
         return self
 
     def _predict_one(self, frame, features, out, index_positions=None):
         import torch
         X = frame[features].to_numpy(np.float32)
         X = np.nan_to_num((X - self.mu) / self.sd)
-        if len(X) <= self.seq_len:
+        total = max(0, len(X) - self.seq_len)
+        if total == 0:
             return
         device = next(self.net.parameters()).device
         self.net.eval()
-        total = len(X) - self.seq_len
         done = 0
         with torch.inference_mode():
             for start_pos, wx in self._iter_predict_batches(X):
@@ -122,12 +108,11 @@ class V42Transformer:
                 h = self.net[0](tx)
                 h = self.net[1](h)
                 pred = self.net[2](h[:, -1, :]).squeeze(-1).cpu().numpy()
-                begin = start_pos
-                end = begin + len(pred)
+                end_pos = start_pos + len(pred)
                 if index_positions is None:
-                    out[begin:end] = pred
+                    out[start_pos:end_pos] = pred
                 else:
-                    out[index_positions[begin:end]] = pred
+                    out[index_positions[start_pos:end_pos]] = pred
                 done += len(pred)
         print(f"[Transformer] inference {done}/{total} samples batch={self.infer_batch_size} device={device}")
 
@@ -135,14 +120,11 @@ class V42Transformer:
         out = np.full(len(frame), np.nan, np.float32)
         if self.net is None or len(frame) == 0:
             return out
-        # Never let a sequence cross from one stock into another. This also makes inference memory bounded.
+        # Do not allow a sequence to cross from one stock into another.
         if "symbol" in frame.columns:
-            groups = frame.groupby("symbol", sort=False).indices
-            for symbol, positions in groups.items():
+            for _, positions in frame.groupby("symbol", sort=False).indices.items():
                 positions = np.asarray(positions, dtype=np.int64)
-                # Preserve the frame's existing per-symbol order.
-                sub = frame.iloc[positions]
-                self._predict_one(sub, features, out, positions)
+                self._predict_one(frame.iloc[positions], features, out, positions)
         else:
             self._predict_one(frame, features, out)
         return out
