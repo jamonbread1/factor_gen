@@ -1,25 +1,76 @@
+from __future__ import annotations
+
 import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
 from loguru import logger
 from tqdm import tqdm
-from factor_engine import FactorEngine
+
+from factor_engine import FactorEngine, evaluate_ic, make_target
+from factor_search import MillionFactorSearch
+from gm3_export import export_gm3_factor
+
+
+def setup_logger(out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logger.add(out_dir / "run.log", rotation="10 MB", encoding="utf-8")
 
 
 def main():
-    parser=argparse.ArgumentParser()
-    parser.add_argument('--data',required=True)
-    args=parser.parse_args()
+    p = argparse.ArgumentParser(description="GM3 AI Factor Generator V2")
+    p.add_argument("--data", required=True, help="GM3 K线 CSV: open,high,low,close,volume")
+    p.add_argument("--config", default="config.yaml")
+    args = p.parse_args()
+    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    out = Path(cfg.get("output_dir", "generated"))
+    setup_logger(out)
+    torch.manual_seed(cfg.get("seed", 42)); np.random.seed(cfg.get("seed", 42))
+    logger.info("=" * 70)
+    logger.info("GM3 AI 因子发现系统 V2 启动")
+    logger.info(f"RTX 3050 4GB 模式: 小模型 + AMP + batch={cfg.get('batch_size', 32)}")
+    logger.info("=" * 70)
+    df = pd.read_csv(args.data)
+    logger.info(f"K线加载完成: {len(df):,} rows")
 
-    logger.info('启动 GM3 AI 因子发现系统')
-    engine=FactorEngine(args.data)
-    logger.info('加载K线数据完成')
+    logger.info("[1/4] Transformer 学习 K线序列规律")
+    engine = FactorEngine(df, seq_len=cfg.get("seq_len", 64), device=cfg.get("device", "auto"))
+    ai_score = engine.train(epochs=cfg.get("epochs", 5), batch_size=cfg.get("batch_size", 32), lr=cfg.get("learning_rate", 2e-4))
+    target = make_target(df)
+    ai_result = evaluate_ic(ai_score, target, cfg.get("ic_window", 252), cfg.get("ic_threshold", 0.03))
+    logger.info(f"AI因子当前IC={ai_result.ic:.4f} | 稳定均值IC={ai_result.mean_ic:.4f} | 状态={ai_result.status}")
 
-    for step in tqdm(range(5),desc='AI搜索进度'):
-        engine.search_step(step)
+    logger.info("[2/4] AI/符号组合搜索")
+    searcher = MillionFactorSearch(df, cfg.get("candidate_count", 1_000_000), cfg.get("top_k", 100), cfg.get("ic_threshold", 0.03))
+    candidates = searcher.search()
+    logger.info(f"搜索完成: Top {len(candidates)}")
 
-    result=engine.evaluate()
-    logger.info(f'最佳因子IC={result["ic"]:.4f}')
-    logger.info(result)
+    logger.info("[3/4] 对候选因子做稳定性复核")
+    verified = []
+    for c in tqdm(candidates, desc="稳定性验证"):
+        local = {k: v for k, v in searcher.cache.items()}
+        value = eval(c.expression, {"__builtins__": {}}, local)
+        r = evaluate_ic(pd.Series(value, index=df.index), target, cfg.get("ic_window", 252), cfg.get("ic_threshold", 0.03))
+        verified.append({"expression": c.expression, "ic": r.ic, "mean_ic": r.mean_ic, "median_ic": r.median_ic, "ic_ir": r.ic_ir, "positive_ratio": r.positive_ratio, "status": r.status})
+    verified.sort(key=lambda x: (x["status"] == "PASS", x["mean_ic"], x["ic_ir"]), reverse=True)
+
+    logger.info("[4/4] 生成 GM3 插件和报告")
+    best = verified[0] if verified else {"expression": "ret1", "status": "FAIL", "mean_ic": 0.0}
+    plugin = export_gm3_factor(best["expression"], "ai_factor_v2", out)
+    report = {"device": str(engine.device), "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU", "threshold": cfg.get("ic_threshold", 0.03), "ai_factor": ai_result.__dict__, "best_factor": best, "verified_candidates": verified[:20], "plugin": str(plugin)}
+    (out / "factor_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"最佳因子: {best['expression']} | mean IC={best['mean_ic']:.4f} | {best['status']}")
+    logger.info(f"GM3插件: {plugin}")
+    logger.info(f"报告: {out / 'factor_report.json'}")
+    if best["status"] != "PASS":
+        logger.warning("没有验证出稳定 IC > 0.03 的因子。系统不会伪造 PASS；请增加数据长度、换品种或扩大搜索空间。")
+    else:
+        logger.success("发现稳定有效因子：IC 稳定达到 0.03 以上")
 
 
-if __name__=='__main__':
+if __name__ == "__main__":
     main()
