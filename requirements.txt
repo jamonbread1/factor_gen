@@ -1,6 +1,8 @@
-# GM3 data access is supplied by the 掘金 terminal environment.
-# PyTorch wheels bundle the CUDA runtime; nvidia-smi CUDA 13.1 is the driver capability.
+# GM3 data access is supplied by the 掘金3 terminal environment.
+# For RTX 30-series on Windows, install the matching official PyTorch CUDA wheel
+# (for example cu128) rather than a +cpu build.
 torch>=2.4
+transformers>=4.40,<5
 pandas>=2.0
 numpy>=1.26
 scipy>=1.11
