@@ -1,33 +1,40 @@
-# factor_gen V3 — GM3 AI Factor Discovery
+# factor_gen V5 — GM3 AI Factor Discovery
 
-面向掘金 GM3 环境的 AI 自动因子发现框架。**数据全部由掘金 `gm.api` 提供，不依赖 CSV。**
+面向掘金 GM3 的 AI 自动因子发现框架。数据由 `gm.api` 提供，Transformer 从 K 线序列学习 `ai_score`，再进行百万级候选组合搜索。
 
-流程：GM3 历史 K 线 → 特征工程 → Transformer → IC / RankIC → 时间滚动稳定性 → 百万候选组合搜索 → 自动生成 GM3 因子模板。
+V5 参考 QuantSkills 的因子挖掘/评估思路：
 
-默认筛选门槛：`mean IC > 0.03`，同时要求 median IC > 0.03、IC>0.03 窗口比例 >= 60%。没有达标候选时明确输出 `NO_PASS`，不会人为制造 PASS。
+- Train / Valid / Test 严格时间隔离，Test 在候选冻结后才打开；
+- 候选按 Valid IC 排名，相关性门控避免 Top-K 高度同质化；
+- IC、RankIC、IC-IR、median IC、正 IC 比例；
+- 分层单调性、Top 组换手率、1/3/5/10 日衰减；
+- 保存 Top-K 候选和完整 JSON 研究报告；
+- 无论 PASS / FAIL 都保存最佳候选因子，FAIL 不再丢失；
+- 同时保存 Transformer checkpoint，最终因子可以组合 `ai_score` 使用。
 
-针对 RTX 3050 4GB：hidden_dim=32、layers=2、heads=4、seq_len=32、CUDA AMP。
+## 运行
 
-## 在掘金3运行
+先在掘金3环境安装依赖，然后：
 
-```python
-from factor_gen.gm3.runner import run
-run()
+```bash
+python run_v5.py --start 2022-01-01 --end 2026-08-01 --index SHSE.000300
 ```
 
-也可运行 `examples/run_gm3.py`。GM3 数据适配集中在 `factor_gen/gm3/adapter.py`，以便兼容不同 SDK 版本。
+也可以在 `config.yaml` 中指定 `symbols`，避免每次重新获取指数成分。
 
 ## 输出
 
 ```text
-factor_gen_output/
-  run.log
-  report.json
-  best_factor.py
+generated/
+  ai_factor_v5.py
+  ai_transformer_v5.pt
+  factor_report_v5.json
 ```
 
-不包含 GM_TOKEN。请通过掘金环境或环境变量提供 token。
+`ai_factor_v5.py` 是可交付的因子文件；如果该因子包含 `ai_score`，运行时需要传入 Transformer 输出或先写入 `df["ai_score"]`。
 
-## 重要说明
+## 验收原则
 
-`IC > 0.03` 是筛选条件，不是保证。真正有效性必须用未参与搜索的 out-of-sample / walk-forward 数据复核，避免未来数据泄漏、多重测试和过拟合。
+默认门槛：mean IC > 0.03、median IC > 0.03、IC > 0.03 的窗口比例 >= 60%、IC-IR >= 0.50。门槛只用于研究筛选，不代表未来收益保证。
+
+最重要的是：**Test 只用于最终 OOS 验证，不参与候选搜索、排序、相关性门控或最终因子选择。**
