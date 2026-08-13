@@ -9,111 +9,99 @@ import pandas as pd
 
 from .ai.transformer_v42 import V42Transformer
 from .evaluation.qsk import evaluate
-from .search.qsk_miner import Candidate, BASE_FEATURES, evaluate_spec, transform
+from .search.qsk_miner import Candidate, BASE_FEATURES, evaluate_spec
 
 LOG = logging.getLogger("factor_gen.qsk_v5")
-
 BASE_PANEL = ["ret1", "ret5", "ret10", "range", "body", "close_pos", "vol_z20", "ma_gap5", "ma_gap20", "volatility20", "trend20"]
 
 
 def make_panel(df: pd.DataFrame) -> pd.DataFrame:
-    x = df.copy().sort_values(["symbol", "eob"]).reset_index(drop=True)
-    g = x.groupby("symbol", group_keys=False)
+    x = df.copy().sort_values(["symbol", "eob"]).reset_index(drop=True); g = x.groupby("symbol", group_keys=False)
     c = x["close"].astype(float).clip(lower=1e-12)
-    x["ret1"] = g["close"].pct_change()
-    x["ret5"] = g["close"].pct_change(5)
-    x["ret10"] = g["close"].pct_change(10)
-    x["range"] = (x.high - x.low) / c
-    x["body"] = (x.close - x.open) / c
-    x["close_pos"] = (x.close - x.low) / (x.high - x.low).replace(0, np.nan)
-    lv = np.log1p(x.volume.astype(float).clip(lower=0))
-    x["vol_z20"] = g["volume"].transform(lambda s: (np.log1p(s.clip(lower=0)) - np.log1p(s.clip(lower=0)).rolling(20, min_periods=10).mean()) / (np.log1p(s.clip(lower=0)).rolling(20, min_periods=10).std() + 1e-8))
-    x["ma_gap5"] = g["close"].transform(lambda s: s / s.rolling(5, min_periods=5).mean() - 1)
-    x["ma_gap20"] = g["close"].transform(lambda s: s / s.rolling(20, min_periods=20).mean() - 1)
-    x["volatility20"] = g["ret1"].transform(lambda s: s.rolling(20, min_periods=10).std())
-    x["trend20"] = g["close"].transform(lambda s: s.rolling(20, min_periods=10).mean()) / c - 1
-    for h in (1, 3, 5, 10): x[f"target_{h}"] = g["close"].shift(-h) / c - 1
+    x["ret1"] = g["close"].pct_change(); x["ret5"] = g["close"].pct_change(5); x["ret10"] = g["close"].pct_change(10)
+    x["range"] = (x.high-x.low)/c; x["body"] = (x.close-x.open)/c; x["close_pos"] = (x.close-x.low)/(x.high-x.low).replace(0,np.nan)
+    x["vol_z20"] = g["volume"].transform(lambda s:(np.log1p(s.clip(lower=0))-np.log1p(s.clip(lower=0)).rolling(20,min_periods=10).mean())/(np.log1p(s.clip(lower=0)).rolling(20,min_periods=10).std()+1e-8))
+    x["ma_gap5"] = g["close"].transform(lambda s:s/s.rolling(5,min_periods=5).mean()-1); x["ma_gap20"] = g["close"].transform(lambda s:s/s.rolling(20,min_periods=20).mean()-1)
+    x["volatility20"] = g["ret1"].transform(lambda s:s.rolling(20,min_periods=10).std()); x["trend20"] = g["close"].transform(lambda s:s.rolling(20,min_periods=10).mean())/c-1
+    for h in (1,3,5,10): x[f"target_{h}"] = g["close"].shift(-h)/c-1
     x["target"] = x["target_1"]
-    return x.replace([np.inf, -np.inf], np.nan).dropna(subset=BASE_PANEL + ["target"]).reset_index(drop=True)
+    return x.replace([np.inf,-np.inf],np.nan).dropna(subset=BASE_PANEL+["target"]).reset_index(drop=True)
 
 
 def split_by_time(df, train_ratio=.60, valid_ratio=.20):
-    dates = np.sort(df.eob.unique()); a = int(len(dates) * train_ratio); b = int(len(dates) * (train_ratio + valid_ratio))
-    if a < 10 or b <= a or b >= len(dates): raise ValueError("时间切分后样本不足，请增加历史K线长度")
-    return tuple(df[df.eob.isin(part)].copy() for part in (dates[:a], dates[a:b], dates[b:]))
+    dates=np.sort(df.eob.unique()); a=int(len(dates)*train_ratio); b=int(len(dates)*(train_ratio+valid_ratio))
+    if a<10 or b<=a or b>=len(dates): raise ValueError("时间切分后样本不足，请增加历史K线长度")
+    return tuple(df[df.eob.isin(part)].copy() for part in (dates[:a],dates[a:b],dates[b:]))
 
 
 def add_ai_score(train, valid, test, cfg):
-    model = V42Transformer(seq_len=int(cfg.get("seq_len", 64)), epochs=int(cfg.get("epochs", 5)), batch_size=int(cfg.get("batch_size", 32)), d_model=int(cfg.get("d_model", 32)), heads=int(cfg.get("heads", 4)), layers=int(cfg.get("layers", 2)))
-    model.fit(train, BASE_PANEL, "target")
-    parts = []
-    for p in (train.copy(), valid.copy(), test.copy()):
-        p["ai_score"] = model.predict(p, BASE_PANEL)
-        parts.append(p.dropna(subset=["ai_score"]).reset_index(drop=True))
-    return model, tuple(parts)
+    model=V42Transformer(seq_len=int(cfg.get("seq_len",64)),epochs=int(cfg.get("epochs",5)),batch_size=int(cfg.get("batch_size",32)),d_model=int(cfg.get("d_model",32)),heads=int(cfg.get("heads",4)),layers=int(cfg.get("layers",2)))
+    model.fit(train,BASE_PANEL,"target"); parts=[]
+    for p in (train.copy(),valid.copy(),test.copy()):
+        p["ai_score"]=model.predict(p,BASE_PANEL); parts.append(p.dropna(subset=["ai_score"]).reset_index(drop=True))
+    return model,tuple(parts)
 
 
-def candidate_frame(frame, candidate: Candidate):
-    spec = (candidate.feature_idx, candidate.transforms, candidate.op, candidate.weights, candidate.expression)
-    out = frame.copy(); out["factor_value"] = evaluate_spec(frame, spec)
-    return out.replace([np.inf, -np.inf], np.nan).dropna(subset=["factor_value"] + BASE_PANEL + ["target"])
+def candidate_frame(frame,candidate:Candidate):
+    spec=(candidate.feature_idx,candidate.transforms,candidate.op,candidate.weights,candidate.expression)
+    out=frame.copy(); out["factor_value"]=evaluate_spec(frame,spec)
+    return out.replace([np.inf,-np.inf],np.nan).dropna(subset=["factor_value"]+BASE_PANEL+["target"])
 
 
-def corr_gate(selected_values, value, threshold=.85):
+def corr_gate(selected_values,value,threshold=.85):
     for old in selected_values:
-        a = pd.Series(old).rank(); b = pd.Series(value).rank(); m = a.notna() & b.notna()
-        if m.sum() and abs(float(a[m].corr(b[m]))) >= threshold: return False
+        a=pd.Series(old).rank(); b=pd.Series(value).rank(); m=a.notna()&b.notna()
+        if m.sum() and abs(float(a[m].corr(b[m])))>=threshold: return False
     return True
 
 
-def _save_transformer(model, path):
-    if model.net is None:
-        return False
+def _save_transformer(model,path):
+    if model.net is None: return False
     import torch
-    payload = {"state_dict": model.net.state_dict(), "mu": model.mu, "sd": model.sd, "seq_len": model.seq_len, "d_model": model.d_model, "heads": model.heads, "layers": model.layers}
-    Path(path).parent.mkdir(parents=True, exist_ok=True); torch.save(payload, path); return True
+    payload={"state_dict":model.net.state_dict(),"mu":model.mu,"sd":model.sd,"seq_len":model.seq_len,"d_model":model.d_model,"heads":model.heads,"layers":model.layers}
+    Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path); return True
 
 
-def _export_factor(candidate, report, out_path):
-    expr = candidate.expression
-    code = f'''# Auto-generated by factor_gen QuantSkills-style V5\n# expression: {expr}\n# test_mean_ic={report.mean_ic:.8f}\n# test_median_ic={report.median_ic:.8f}\n# test_ic_ir={report.ic_ir:.8f}\n# positive_ratio={report.positive_ratio:.8f}\n\nimport numpy as np\n\ndef identity(x): return x\ndef neg(x): return -x\ndef abs_(x): return np.abs(x)\ndef tanh(x): return np.tanh(np.clip(x, -8, 8))\ndef square(x): return np.sign(x) * np.square(np.clip(x, -3, 3))\n\ndef factor(df, ai_score=None):\n    c = df["close"].astype(float).clip(lower=1e-12)\n    o = df["open"].astype(float); h = df["high"].astype(float); l = df["low"].astype(float); v = df["volume"].astype(float)\n    r1 = df["close"].pct_change(); r5 = df["close"].pct_change(5); r10 = df["close"].pct_change(10)\n    ret1 = r1; ret5 = r5; ret10 = r10\n    range = (h-l)/c; body=(c-o)/c; close_pos=(c-l)/(h-l).replace(0,np.nan)\n    vol_z20=(np.log1p(v.clip(lower=0))-np.log1p(v.clip(lower=0)).rolling(20,min_periods=10).mean())/(np.log1p(v.clip(lower=0)).rolling(20,min_periods=10).std()+1e-8)\n    ma_gap5=c/c.rolling(5,min_periods=5).mean()-1; ma_gap20=c/c.rolling(20,min_periods=20).mean()-1\n    volatility20=r1.rolling(20,min_periods=10).std(); trend20=c.rolling(20,min_periods=10).mean()/c-1\n    if ai_score is None:\n        if "ai_score" not in df: raise ValueError("该因子依赖 Transformer ai_score；请传入 ai_score 或先在 df 中生成 ai_score")\n        ai_score=df["ai_score"]\n    return {expr}\n'''
-    code = code.replace("abs(", "abs_(").replace("abs_(_", "abs_(")
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True); Path(out_path).write_text(code, encoding="utf-8")
+def _export_factor(candidate,report,out_path):
+    expr=candidate.expression
+    code=f'''# Auto-generated by factor_gen QuantSkills-style V5\n# expression: {expr}\n# validation_mean_ic={report.mean_ic:.8f}\n# test_mean_ic={report.mean_ic:.8f}\n# test_median_ic={report.median_ic:.8f}\n# test_ic_ir={report.ic_ir:.8f}\n# positive_ratio={report.positive_ratio:.8f}\nimport numpy as np\ndef identity(x): return x\ndef neg(x): return -x\ndef abs_(x): return np.abs(x)\ndef tanh(x): return np.tanh(np.clip(x,-8,8))\ndef square(x): return np.sign(x)*np.square(np.clip(x,-3,3))\ndef factor(df, ai_score=None):\n    c=df["close"].astype(float).clip(lower=1e-12); o=df["open"].astype(float); h=df["high"].astype(float); l=df["low"].astype(float); v=df["volume"].astype(float)\n    ret1=df["close"].pct_change(); ret5=df["close"].pct_change(5); ret10=df["close"].pct_change(10); range=(h-l)/c; body=(c-o)/c; close_pos=(c-l)/(h-l).replace(0,np.nan)\n    vol_z20=(np.log1p(v.clip(lower=0))-np.log1p(v.clip(lower=0)).rolling(20,min_periods=10).mean())/(np.log1p(v.clip(lower=0)).rolling(20,min_periods=10).std()+1e-8)\n    ma_gap5=c/c.rolling(5,min_periods=5).mean()-1; ma_gap20=c/c.rolling(20,min_periods=20).mean()-1; volatility20=ret1.rolling(20,min_periods=10).std(); trend20=c.rolling(20,min_periods=10).mean()/c-1\n    if ai_score is None:\n        if "ai_score" not in df: raise ValueError("该因子依赖 Transformer ai_score；请传入 ai_score 或先在 df 中生成 ai_score")\n        ai_score=df["ai_score"]\n    return {expr}\n'''.replace("abs(","abs_(")
+    Path(out_path).parent.mkdir(parents=True,exist_ok=True); Path(out_path).write_text(code,encoding="utf-8")
 
 
-def run(train, valid, test, cfg=None):
-    cfg = cfg or {}; out = Path(cfg.get("output_dir", "generated")); out.mkdir(parents=True, exist_ok=True)
-    model, (train, valid, test) = add_ai_score(train, valid, test, cfg)
-    LOG.info("split rows train=%d valid=%d test=%d", len(train), len(valid), len(test))
+def run(train,valid,test,cfg=None):
+    cfg=cfg or {}; out=Path(cfg.get("output_dir","generated")); out.mkdir(parents=True,exist_ok=True)
+    model,(train,valid,test)=add_ai_score(train,valid,test,cfg); LOG.info("split rows train=%d valid=%d test=%d",len(train),len(valid),len(test))
     from .search.qsk_miner import search
-    candidates = search(train, int(cfg.get("candidate_count", 1_000_000)), int(cfg.get("top_k", 1000)), int(cfg.get("seed", 42)), int(cfg.get("screen_batch", 100_000)))
-    ranked = []
-    for i, c in enumerate(candidates, 1):
-        vf = candidate_frame(valid, c); tr = candidate_frame(train, c)
-        if len(vf) == 0: continue
-        vr = evaluate(vf, "factor_value", float(cfg.get("ic_threshold", .03)), float(cfg.get("min_positive_window_ratio", .60)))
-        ranked.append((vr.mean_ic, c, vr))
-        if i % 100 == 0: LOG.info("validation %d/%d", i, len(candidates))
-    ranked.sort(key=lambda z: (z[2].mean_ic, z[2].ic_ir, -z[2].turnover if np.isfinite(z[2].turnover) else -999), reverse=True)
-    selected = []; selected_values = []
-    for _, c, vr in ranked:
-        tf = candidate_frame(test, c)
-        if len(tf) == 0: continue
-        value = tf["factor_value"].to_numpy(float)
-        if not corr_gate(selected_values, value, float(cfg.get("correlation_gate", .85))): continue
-        tr = evaluate(candidate_frame(train, c), "factor_value", float(cfg.get("ic_threshold", .03)), float(cfg.get("min_positive_window_ratio", .60)))
-        vr = evaluate(candidate_frame(valid, c), "factor_value", float(cfg.get("ic_threshold", .03)), float(cfg.get("min_positive_window_ratio", .60)))
-        te = evaluate(tf, "factor_value", float(cfg.get("ic_threshold", .03)), float(cfg.get("min_positive_window_ratio", .60)))
-        selected.append({"candidate": c, "train": tr, "valid": vr, "test": te}); selected_values.append(value)
-        if len(selected) >= int(cfg.get("final_top_k", 20)): break
-    if not selected: raise RuntimeError("没有通过数据完整性/相关性门控的候选因子")
-    passed = [x for x in selected if x["test"].status == "PASS"]
-    best = sorted(passed or selected, key=lambda x: (x["test"].mean_ic, x["test"].ic_ir, x["test"].median_ic), reverse=True)[0]
-    c, report = best["candidate"], best["test"]
-    factor_path = out / "ai_factor_v5.py"; _export_factor(c, report, factor_path)
-    model_path = out / "ai_transformer_v5.pt"; model_saved = _save_transformer(model, model_path)
-    payload = {"version":"5.0-qsk","status":report.status,"expression":c.expression,"train":best["train"].to_dict(),"valid":best["valid"].to_dict(),"test":report.to_dict(),"model":str(model_path) if model_saved else None,"factor":str(factor_path),"top_candidates":[{"expression":x["candidate"].expression,"test":x["test"].to_dict()} for x in selected]}
-    (out/"factor_report_v5.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    LOG.info("FINAL %s testIC=%.5f mean=%.5f median=%.5f IR=%.3f positive=%.2f", report.status, report.ic, report.mean_ic, report.median_ic, report.ic_ir, report.positive_ratio)
-    LOG.info("factor exported: %s", factor_path)
+    candidates=search(train,int(cfg.get("candidate_count",1_000_000)),int(cfg.get("top_k",1000)),int(cfg.get("seed",42)),int(cfg.get("screen_batch",100_000)))
+    ranked=[]
+    for i,c in enumerate(candidates,1):
+        vf=candidate_frame(valid,c)
+        if len(vf)==0: continue
+        vr=evaluate(vf,"factor_value",float(cfg.get("ic_threshold",.03)),float(cfg.get("min_positive_window_ratio",.60)))
+        ranked.append((vr.mean_ic,c,vr))
+        if i%100==0: LOG.info("validation %d/%d",i,len(candidates))
+    ranked.sort(key=lambda z:(z[2].mean_ic,z[2].ic_ir,-z[2].turnover if np.isfinite(z[2].turnover) else -999),reverse=True)
+    # IMPORTANT: only Train/Valid are used before the test set is opened.
+    frozen=[]; frozen_values=[]
+    for _,c,vr in ranked:
+        vf=candidate_frame(valid,c)
+        if len(vf)==0: continue
+        if not corr_gate(frozen_values,vf["factor_value"].to_numpy(float),float(cfg.get("correlation_gate",.85))): continue
+        tr=evaluate(candidate_frame(train,c),"factor_value",float(cfg.get("ic_threshold",.03)),float(cfg.get("min_positive_window_ratio",.60)))
+        frozen.append({"candidate":c,"train":tr,"valid":vr}); frozen_values.append(vf["factor_value"].to_numpy(float))
+        if len(frozen)>=int(cfg.get("final_top_k",20)): break
+    if not frozen: raise RuntimeError("没有通过 Train/Valid 数据完整性与相关性门控的候选因子")
+    # Freeze checkpoint; only now evaluate OOS/Test.
+    evaluated=[]
+    for item in frozen:
+        tf=candidate_frame(test,item["candidate"])
+        te=evaluate(tf,"factor_value",float(cfg.get("ic_threshold",.03)),float(cfg.get("min_positive_window_ratio",.60))) if len(tf) else evaluate(pd.DataFrame(columns=["eob","symbol","factor_value","target"]),"factor_value")
+        evaluated.append({**item,"test":te})
+    best=sorted(evaluated,key=lambda x:(x["valid"]["mean_ic"],x["valid"]["ic_ir"],x["valid"]["median_ic"]),reverse=True)[0]
+    c=best["candidate"]; report=best["test"]
+    factor_path=out/"ai_factor_v5.py"; _export_factor(c,report,factor_path)
+    model_path=out/"ai_transformer_v5.pt"; model_saved=_save_transformer(model,model_path)
+    payload={"version":"5.0-qsk","status":report.status,"selection_basis":"validation_only","expression":c.expression,"train":best["train"].to_dict(),"valid":best["valid"].to_dict(),"test":report.to_dict(),"model":str(model_path) if model_saved else None,"factor":str(factor_path),"top_candidates":[{"expression":x["candidate"].expression,"valid":x["valid"].to_dict(),"test":x["test"].to_dict()} for x in evaluated]}
+    (out/"factor_report_v5.json").write_text(json.dumps(payload,ensure_ascii=False,indent=2,default=str),encoding="utf-8")
+    LOG.info("FINAL %s testIC=%.5f mean=%.5f median=%.5f IR=%.3f positive=%.2f",report.status,report.ic,report.mean_ic,report.median_ic,report.ic_ir,report.positive_ratio); LOG.info("factor exported: %s",factor_path)
     return payload
