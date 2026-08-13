@@ -19,8 +19,7 @@ class V42Transformer:
         return wx,wy
 
     def _windows_by_symbol(self, frame, features, target):
-        xs=[]; ys=[]
-        ordered=frame.sort_values(["symbol","eob"],kind="stable")
+        xs=[]; ys=[]; ordered=frame.sort_values(["symbol","eob"],kind="stable")
         for _,part in ordered.groupby("symbol",sort=False):
             X=part[features].to_numpy(np.float32); y=part[target].to_numpy(np.float32)
             if len(X)<self.seq_len: continue
@@ -49,13 +48,10 @@ class V42Transformer:
             import torch.nn as nn
         except ImportError:
             self.net=None; print("[Transformer] PyTorch not installed; AI score disabled"); return self
-        ordered=frame.sort_values(["symbol","eob"],kind="stable").copy()
-        X_all=ordered[features].to_numpy(np.float32); self.mu=np.nanmean(X_all,axis=0); self.sd=np.nanstd(X_all,axis=0)+1e-6
-        normalized=ordered.copy(); normalized.loc[:,features]=np.nan_to_num((X_all-self.mu)/self.sd)
-        wx,wy=self._windows_by_symbol(normalized,features,target)
+        ordered=frame.sort_values(["symbol","eob"],kind="stable").copy(); X_all=ordered[features].to_numpy(np.float32); self.mu=np.nanmean(X_all,axis=0); self.sd=np.nanstd(X_all,axis=0)+1e-6
+        normalized=ordered.copy(); normalized.loc[:,features]=np.nan_to_num((X_all-self.mu)/self.sd); wx,wy=self._windows_by_symbol(normalized,features,target)
         if len(wx)==0: print("[Transformer] no training windows"); return self
-        wy=np.nan_to_num(wy.astype(np.float32),nan=0.0,posinf=0.0,neginf=0.0)
-        self.device=self._get_device(torch); proj=nn.Linear(wx.shape[2],self.d_model); enc_layer=nn.TransformerEncoderLayer(d_model=self.d_model,nhead=self.heads,batch_first=True); enc=nn.TransformerEncoder(enc_layer,self.layers); head=nn.Linear(self.d_model,1); self.net=nn.ModuleList([proj,enc,head]).to(self.device)
+        wy=np.nan_to_num(wy.astype(np.float32),nan=0.0,posinf=0.0,neginf=0.0); self.device=self._get_device(torch); proj=nn.Linear(wx.shape[2],self.d_model); enc_layer=nn.TransformerEncoderLayer(d_model=self.d_model,nhead=self.heads,batch_first=True); enc=nn.TransformerEncoder(enc_layer,self.layers); head=nn.Linear(self.d_model,1); self.net=nn.ModuleList([proj,enc,head]).to(self.device)
         opt=torch.optim.AdamW(self.net.parameters(),lr=self.learning_rate,weight_decay=1e-4); loss_fn=nn.HuberLoss(); tx_cpu=torch.from_numpy(wx); ty_cpu=torch.from_numpy(wy); n=len(tx_cpu)
         if n!=len(ty_cpu): raise RuntimeError(f"Transformer training data mismatch: X={n} y={len(ty_cpu)}")
         print(f"[Transformer] training samples={n} batch={self.batch_size} lr={self.learning_rate} device={self.device} chunked=True")
@@ -68,11 +64,9 @@ class V42Transformer:
 
     def _predict_one(self,frame,features,out,index_positions=None):
         import torch
-        ordered=frame.sort_values(["symbol","eob"],kind="stable").copy() if "symbol" in frame.columns else frame.copy()
-        X=ordered[features].to_numpy(np.float32); X=np.nan_to_num((X-self.mu)/self.sd); total=max(0,len(X)-self.seq_len+1)
+        ordered=frame.sort_values(["symbol","eob"],kind="stable").copy() if "symbol" in frame.columns else frame.copy(); X=ordered[features].to_numpy(np.float32); X=np.nan_to_num((X-self.mu)/self.sd); total=max(0,len(X)-self.seq_len+1)
         if total==0: return
-        device=next(self.net.parameters()).device; self.net.eval(); done=0
-        local_positions=np.asarray(ordered.index,dtype=np.int64)
+        device=next(self.net.parameters()).device; self.net.eval(); done=0; local_positions=np.arange(len(ordered),dtype=np.int64)
         with torch.inference_mode():
             for start_pos,wx in self._iter_predict_batches(X):
                 tx=torch.from_numpy(wx).to(device,non_blocking=True); h=self.net[0](tx); h=self.net[1](h); pred=self.net[2](h[:,-1,:]).squeeze(-1).cpu().numpy(); end_pos=start_pos+len(pred); target_positions=local_positions[start_pos:end_pos]
@@ -85,8 +79,7 @@ class V42Transformer:
         out=np.full(len(frame),np.nan,np.float32)
         if self.net is None or len(frame)==0: return out
         if "symbol" in frame.columns:
-            positions=frame.groupby("symbol",sort=False).indices
-            for _,pos in positions.items():
-                pos=np.asarray(pos,dtype=np.int64); sub=frame.iloc[pos].copy(); self._predict_one(sub,features,out,pos)
+            for _,pos in frame.groupby("symbol",sort=False).indices.items():
+                pos=np.asarray(pos,dtype=np.int64); self._predict_one(frame.iloc[pos].copy(),features,out,pos)
         else: self._predict_one(frame,features,out)
         return out
