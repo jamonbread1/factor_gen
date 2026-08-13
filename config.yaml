@@ -1,14 +1,23 @@
-# factor_gen V2 defaults for a 4 GB RTX 3050
+# factor_gen V5
+# Prefer configuring GM_TOKEN in the GM3 project environment.
+# gm_token: "YOUR_GM_TOKEN"
+gm_token: null
+
 seed: 42
 seq_len: 64
 epochs: 5
 batch_size: 32
+d_model: 32
+heads: 4
+layers: 2
 learning_rate: 0.0002
-device: auto
-amp: true
 candidate_count: 1000000
-top_k: 100
+screen_batch: 100000
+top_k: 1000
+final_top_k: 20
 ic_threshold: 0.03
-ic_window: 252
 min_positive_window_ratio: 0.60
+correlation_gate: 0.85
+train_ratio: 0.60
+valid_ratio: 0.20
 output_dir: generated
