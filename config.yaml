@@ -1,4 +1,8 @@
-# factor_gen QuantSkills-style V5 defaults
+# factor_gen V5
+# Prefer configuring GM_TOKEN in the GM3 project environment.
+# gm_token: "YOUR_GM_TOKEN"
+gm_token: null
+
 seed: 42
 seq_len: 64
 epochs: 5
