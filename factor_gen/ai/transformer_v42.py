@@ -20,7 +20,8 @@ class V42Transformer:
 
     def _windows_by_symbol(self, frame, features, target):
         xs=[]; ys=[]
-        for _,part in frame.groupby("symbol",sort=False):
+        ordered=frame.sort_values(["symbol","eob"],kind="stable")
+        for _,part in ordered.groupby("symbol",sort=False):
             X=part[features].to_numpy(np.float32); y=part[target].to_numpy(np.float32)
             if len(X)<self.seq_len: continue
             wx,wy=self._windows(X,y)
@@ -48,8 +49,9 @@ class V42Transformer:
             import torch.nn as nn
         except ImportError:
             self.net=None; print("[Transformer] PyTorch not installed; AI score disabled"); return self
-        X_all=frame[features].to_numpy(np.float32); self.mu=np.nanmean(X_all,axis=0); self.sd=np.nanstd(X_all,axis=0)+1e-6
-        normalized=frame.copy(); normalized.loc[:,features]=np.nan_to_num((X_all-self.mu)/self.sd)
+        ordered=frame.sort_values(["symbol","eob"],kind="stable").copy()
+        X_all=ordered[features].to_numpy(np.float32); self.mu=np.nanmean(X_all,axis=0); self.sd=np.nanstd(X_all,axis=0)+1e-6
+        normalized=ordered.copy(); normalized.loc[:,features]=np.nan_to_num((X_all-self.mu)/self.sd)
         wx,wy=self._windows_by_symbol(normalized,features,target)
         if len(wx)==0: print("[Transformer] no training windows"); return self
         wy=np.nan_to_num(wy.astype(np.float32),nan=0.0,posinf=0.0,neginf=0.0)
@@ -58,22 +60,24 @@ class V42Transformer:
         if n!=len(ty_cpu): raise RuntimeError(f"Transformer training data mismatch: X={n} y={len(ty_cpu)}")
         print(f"[Transformer] training samples={n} batch={self.batch_size} lr={self.learning_rate} device={self.device} chunked=True")
         for ep in range(self.epochs):
-            self.net.train(); total_loss=0.0; batches=0; order=torch.randperm(n,device="cpu")
+            self.net.train(); total_loss=0.0; batches=0; order_idx=torch.randperm(n,device="cpu")
             for start in range(0,n,self.batch_size):
-                idx=order[start:start+self.batch_size]; xb=tx_cpu[idx].to(self.device,non_blocking=True); yb=ty_cpu[idx].to(self.device,non_blocking=True); h=self.net[0](xb); h=self.net[1](h); pred=self.net[2](h[:,-1,:]).squeeze(-1); loss=loss_fn(pred,yb); opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.net.parameters(),1.0); opt.step(); total_loss+=loss.detach().item(); batches+=1; del xb,yb,h,pred,loss
+                idx=order_idx[start:start+self.batch_size]; xb=tx_cpu[idx].to(self.device,non_blocking=True); yb=ty_cpu[idx].to(self.device,non_blocking=True); h=self.net[0](xb); h=self.net[1](h); pred=self.net[2](h[:,-1,:]).squeeze(-1); loss=loss_fn(pred,yb); opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.net.parameters(),1.0); opt.step(); total_loss+=loss.detach().item(); batches+=1; del xb,yb,h,pred,loss
             print(f"[Transformer] epoch {ep+1}/{self.epochs} loss={total_loss/max(1,batches):.6f} device={self.device}")
         return self
 
     def _predict_one(self,frame,features,out,index_positions=None):
         import torch
-        X=frame[features].to_numpy(np.float32); X=np.nan_to_num((X-self.mu)/self.sd); total=max(0,len(X)-self.seq_len+1)
+        ordered=frame.sort_values(["symbol","eob"],kind="stable").copy() if "symbol" in frame.columns else frame.copy()
+        X=ordered[features].to_numpy(np.float32); X=np.nan_to_num((X-self.mu)/self.sd); total=max(0,len(X)-self.seq_len+1)
         if total==0: return
         device=next(self.net.parameters()).device; self.net.eval(); done=0
+        local_positions=np.asarray(ordered.index,dtype=np.int64)
         with torch.inference_mode():
             for start_pos,wx in self._iter_predict_batches(X):
-                tx=torch.from_numpy(wx).to(device,non_blocking=True); h=self.net[0](tx); h=self.net[1](h); pred=self.net[2](h[:,-1,:]).squeeze(-1).cpu().numpy(); end_pos=start_pos+len(pred)
-                if index_positions is None: out[start_pos:end_pos]=pred
-                else: out[index_positions[start_pos:end_pos]]=pred
+                tx=torch.from_numpy(wx).to(device,non_blocking=True); h=self.net[0](tx); h=self.net[1](h); pred=self.net[2](h[:,-1,:]).squeeze(-1).cpu().numpy(); end_pos=start_pos+len(pred); target_positions=local_positions[start_pos:end_pos]
+                if index_positions is None: out[target_positions]=pred
+                else: out[index_positions[target_positions]]=pred
                 done+=len(pred); del tx,h
         print(f"[Transformer] inference {done}/{total} samples batch={self.infer_batch_size} device={device}")
 
@@ -81,7 +85,8 @@ class V42Transformer:
         out=np.full(len(frame),np.nan,np.float32)
         if self.net is None or len(frame)==0: return out
         if "symbol" in frame.columns:
-            for _,positions in frame.groupby("symbol",sort=False).indices.items():
-                positions=np.asarray(positions,dtype=np.int64); self._predict_one(frame.iloc[positions],features,out,positions)
+            positions=frame.groupby("symbol",sort=False).indices
+            for _,pos in positions.items():
+                pos=np.asarray(pos,dtype=np.int64); sub=frame.iloc[pos].copy(); self._predict_one(sub,features,out,pos)
         else: self._predict_one(frame,features,out)
         return out
